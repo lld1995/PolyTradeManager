@@ -1,0 +1,9 @@
+.vs/
+obj/
+Debug/
+x64/
+x86/
+bin/
+packages/
+test_config.json
+output*.txt
