@@ -11,6 +11,7 @@ using Polymarket.Net.Enums;
 using Polymarket.Net.Objects.Models;
 using System.Globalization;
 using System.Numerics;
+using System.Text;
 using PolyTradeManager;
 
 // ═══════════════════════════════════════════
@@ -279,6 +280,15 @@ async Task LoadData(bool force = false)
 // ═══════════════════════════════════════════
 await LoadData();
 
+// Command-line mode: --redeem-all
+if (args.Length > 0 && args[0] == "--redeem-all")
+{
+    await RedeemAll();
+    client.Dispose();
+    db.Dispose();
+    return;
+}
+
 while (true)
 {
     Console.WriteLine("╔══════════════════════════════════════╗");
@@ -292,6 +302,7 @@ while (true)
     Console.WriteLine("║  6. 增量刷新数据                     ║");
     Console.WriteLine("║  7. 全量刷新 (清除缓存重新拉取)      ║");
     Console.WriteLine("║  8. 缓存统计                         ║");
+    Console.WriteLine("║  9. 清除 pending 交易 (Cancel stuck)  ║");
     Console.WriteLine("║  0. 退出                             ║");
     Console.WriteLine("╚══════════════════════════════════════╝");
     Console.Write("请选择: ");
@@ -307,6 +318,7 @@ while (true)
         case "6": await LoadData(force: true); break;
         case "7": db.ClearAll(); dataLoaded = false; await LoadData(force: true); break;
         case "8": ShowCacheStats(); break;
+        case "9": await CancelPendingTransactions(); break;
         case "0": goto exit;
         default: Console.WriteLine("无效选择\n"); break;
     }
@@ -704,6 +716,133 @@ async Task RedeemAll()
 }
 
 // ═══════════════════════════════════════════
+//  9. 清除 pending 交易 (发送相同 nonce 的 0 值自转账覆盖)
+// ═══════════════════════════════════════════
+async Task CancelPendingTransactions()
+{
+    Console.WriteLine("\n=== 清除 Pending 交易 ===");
+    try
+    {
+        var web3 = CreateSignedWeb3();
+
+        // 获取 pending nonce 和 confirmed nonce
+        var pendingNonce = await web3.Eth.Transactions.GetTransactionCount.SendRequestAsync(
+            walletAddress, Nethereum.RPC.Eth.DTOs.BlockParameter.CreatePending());
+        var confirmedNonce = await web3.Eth.Transactions.GetTransactionCount.SendRequestAsync(
+            walletAddress, Nethereum.RPC.Eth.DTOs.BlockParameter.CreateLatest());
+
+        var pendingCount = (int)(pendingNonce.Value - confirmedNonce.Value);
+        Console.WriteLine($"  钱包地址: {walletAddress}");
+        Console.WriteLine($"  Confirmed nonce: {confirmedNonce.Value}");
+        Console.WriteLine($"  Pending nonce:   {pendingNonce.Value}");
+        Console.WriteLine($"  Pending 交易数:  {pendingCount}");
+
+        if (pendingCount <= 0)
+        {
+            Console.WriteLine("  没有 pending 交易。\n");
+            return;
+        }
+
+        Console.Write($"\n确认要取消 {pendingCount} 笔 pending 交易? (y/N): ");
+        var confirm = Console.ReadLine()?.Trim().ToLower();
+        if (confirm != "y")
+        {
+            Console.WriteLine("  取消。\n");
+            return;
+        }
+
+        // 获取当前 gas price 和 base fee
+        var baseGasPrice = await web3.Eth.GasPrice.SendRequestAsync();
+        var defaultGwei = (decimal)baseGasPrice.Value / 1_000_000_000m;
+        Console.WriteLine($"  当前网络 gas price: {defaultGwei:F2} Gwei");
+
+        // 方式选择
+        Console.WriteLine("  替换方式:");
+        Console.WriteLine("    1. Legacy (GasPrice, 默认 10x)");
+        Console.WriteLine("    2. EIP-1559 (MaxFeePerGas + MaxPriorityFeePerGas)");
+        Console.Write("  选择 (1/2, 默认 1): ");
+        var modeInput = Console.ReadLine()?.Trim();
+        bool useEip1559 = modeInput == "2";
+
+        Console.Write($"  输入 gas 倍数 (默认 10): ");
+        var multInput = Console.ReadLine()?.Trim();
+        decimal multiplier = string.IsNullOrEmpty(multInput) ? 10 : decimal.Parse(multInput);
+        var boostWei = (BigInteger)((decimal)baseGasPrice.Value * multiplier);
+        Console.WriteLine($"  使用 {multiplier}x = {(decimal)boostWei / 1_000_000_000m:F2} Gwei ({boostWei} wei)");
+        Console.WriteLine($"  模式: {(useEip1559 ? "EIP-1559" : "Legacy")}");
+
+        int ok = 0, fail = 0;
+        for (var nonce = confirmedNonce.Value; nonce < pendingNonce.Value; nonce++)
+        {
+            try
+            {
+                Console.Write($"  取消 nonce={nonce} ... ");
+                string txHash;
+                if (useEip1559)
+                {
+                    var tx1559 = new Nethereum.RPC.Eth.DTOs.TransactionInput
+                    {
+                        From = walletAddress,
+                        To = walletAddress,
+                        Value = new HexBigInteger(0),
+                        Nonce = new HexBigInteger(nonce),
+                        Gas = new HexBigInteger(21000),
+                        Type = new HexBigInteger(2),
+                        MaxFeePerGas = new HexBigInteger(boostWei),
+                        MaxPriorityFeePerGas = new HexBigInteger(boostWei),
+                    };
+                    txHash = await web3.Eth.TransactionManager.SendTransactionAsync(tx1559);
+                }
+                else
+                {
+                    txHash = await web3.Eth.TransactionManager.SendTransactionAsync(
+                        new TransactionInput
+                        {
+                            From = walletAddress,
+                            To = walletAddress,
+                            Value = new HexBigInteger(0),
+                            Nonce = new HexBigInteger(nonce),
+                            Gas = new HexBigInteger(21000),
+                            GasPrice = new HexBigInteger(boostWei),
+                        });
+                }
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"✓ tx={txHash}");
+                Console.ResetColor();
+                ok++;
+
+                // 等待确认
+                Console.Write("    等待确认...");
+                var receipt = await web3.Eth.Transactions.GetTransactionReceipt.SendRequestAsync(txHash);
+                int waitCount = 0;
+                while (receipt == null && waitCount < 30)
+                {
+                    await Task.Delay(2000);
+                    receipt = await web3.Eth.Transactions.GetTransactionReceipt.SendRequestAsync(txHash);
+                    waitCount++;
+                }
+                if (receipt != null)
+                    Console.WriteLine($" 已确认 (block={receipt.BlockNumber.Value})");
+                else
+                    Console.WriteLine(" 超时，继续下一笔...");
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"✗ {ex.Message}");
+                Console.ResetColor();
+                fail++;
+            }
+        }
+        Console.WriteLine($"\n清除完成: {ok} 成功, {fail} 失败\n");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"  错误: {ex.Message}\n");
+    }
+}
+
+// ═══════════════════════════════════════════
 //  5. 查看余额
 // ═══════════════════════════════════════════
 async Task ShowBalance()
@@ -948,44 +1087,159 @@ int FindOutcomeIndex(CachedMarket market, string tradeOutcome)
 }
 
 // ═══════════════════════════════════════════
-//  Helper: redeem on-chain
+//  Helper: compute winning index sets based on outcome prices and on-chain balances
+// ═══════════════════════════════════════════
+BigInteger[] GetWinningIndexSets(string conditionId)
+{
+    if (!cachedMarkets.TryGetValue(conditionId, out var market))
+        return new BigInteger[] { 1, 2 }; // fallback: try both sides
+
+    if (market.OutcomePrices == null || market.OutcomePrices.Length == 0)
+        return new BigInteger[] { 1, 2 };
+
+    // Find tokenIds for each outcome from trades
+    var tradesByOutcomeIdx = cachedTrades
+        .Where(t => NormalizeConditionId(t.ConditionId) == conditionId && !string.IsNullOrWhiteSpace(t.TokenId))
+        .GroupBy(t => FindOutcomeIndex(market, t.Outcome))
+        .ToDictionary(g => g.Key, g => g.Select(t => t.TokenId!).Distinct(StringComparer.OrdinalIgnoreCase).ToList());
+
+    var winningIndexSets = new List<BigInteger>();
+    for (int i = 0; i < market.OutcomePrices.Length; i++)
+    {
+        // outcome price > 0 means this side won
+        if (market.OutcomePrices[i] <= 0) continue;
+
+        // check if user holds tokens for this outcome
+        if (tradesByOutcomeIdx.TryGetValue(i, out var tokenIds))
+        {
+            var hasBalance = tokenIds.Any(tid => cachedBalances.TryGetValue(tid, out var bal) && bal > 0);
+            if (hasBalance)
+                winningIndexSets.Add(new BigInteger(1 << i));
+        }
+    }
+
+    return winningIndexSets.Count > 0 ? winningIndexSets.ToArray() : new BigInteger[] { 1, 2 };
+}
+
+// ═══════════════════════════════════════════
+//  Helper: redeem via direct on-chain call (EOA → CTF/NegRisk)
 // ═══════════════════════════════════════════
 async Task<(bool success, string? txHash, string source, string? message)> RedeemPositions(string conditionId, bool isNegRisk)
 {
+    var sourceName = isNegRisk ? "NegRisk" : "CTF";
     try
     {
-        var web3 = CreateSignedWeb3();
-
         var contractAddress = isNegRisk ? NEG_RISK_ADAPTER : CTF_ADDRESS;
+        var normalizedCid = NormalizeConditionId(conditionId) ?? conditionId;
+        var conditionIdHex = normalizedCid[2..];
+        var conditionIdBytes = Convert.FromHexString(conditionIdHex);
+
+        // Step 1: Check if condition is resolved on-chain
+        var preCheckError = await PreCheckConditionResolved(conditionIdHex);
+        if (preCheckError != null)
+            return (false, null, sourceName, preCheckError);
+        Console.Write("[已解析] ");
+
+        // Step 2: Send direct on-chain transaction from EOA
+        var web3 = CreateSignedWeb3();
         var contract = web3.Eth.GetContract(REDEEM_ABI, contractAddress);
         var redeemFunc = contract.GetFunction("redeemPositions");
 
         var parentCollectionId = new byte[32];
-        var hexStr = (NormalizeConditionId(conditionId) ?? conditionId)[2..];
-        var conditionIdBytes = Convert.FromHexString(hexStr);
-        var indexSets = new BigInteger[] { 1, 2 };
+        var indexSets = GetWinningIndexSets(normalizedCid);
+        Console.Write($"[indexSets={string.Join(",", indexSets)}] ");
 
         var txHash = await redeemFunc.SendTransactionAsync(
             walletAddress,
-            new HexBigInteger(300000),
-            null,
+            new Nethereum.Hex.HexTypes.HexBigInteger(300000), // gas limit
+            null, // value
             USDC_E_ADDRESS,
             parentCollectionId,
             conditionIdBytes,
             indexSets);
 
-        return (true, txHash, isNegRisk ? "NegRisk" : "CTF", null);
+        Console.Write($"[tx={txHash[..10]}...] ");
+
+        // Step 3: Wait for receipt
+        var receipt = await web3.Eth.Transactions.GetTransactionReceipt.SendRequestAsync(txHash);
+        int waitCount = 0;
+        while (receipt == null && waitCount < 20)
+        {
+            await Task.Delay(2000);
+            receipt = await web3.Eth.Transactions.GetTransactionReceipt.SendRequestAsync(txHash);
+            waitCount++;
+        }
+
+        if (receipt == null)
+            return (false, txHash, sourceName, "已提交但未确认(超时)");
+
+        if (receipt.Status.Value == 1)
+            return (true, txHash, sourceName, null);
+        else
+            return (false, txHash, sourceName, "交易链上 revert");
     }
     catch (Exception ex)
     {
-        return (false, null, isNegRisk ? "NegRisk" : "CTF", ex.Message);
+        return (false, null, sourceName, ex.Message);
     }
+}
+
+// Pre-check: query CTF.payoutDenominator(conditionId) to verify condition is resolved on-chain.
+// If payoutDenominator == 0, oracle hasn't reported results yet → skip redemption.
+// Uses DIRECT connection (no proxy) since publicnode.com is directly accessible.
+async Task<string?> PreCheckConditionResolved(string conditionIdHex)
+{
+    using var httpClient = new System.Net.Http.HttpClient();
+    httpClient.Timeout = TimeSpan.FromSeconds(10);
+
+    // payoutDenominator(bytes32) selector = 0xdd34de67
+    var calldata = "0xdd34de67" + conditionIdHex.ToLowerInvariant();
+    var rpcBody = Newtonsoft.Json.JsonConvert.SerializeObject(new
+    {
+        jsonrpc = "2.0",
+        method = "eth_call",
+        @params = new object[] {
+            new { to = CTF_ADDRESS, data = calldata, gas = "0x30D40" },
+            "latest"
+        },
+        id = 1
+    });
+
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        try
+        {
+            var resp = await httpClient.PostAsync(POLYGON_RPC,
+                new System.Net.Http.StringContent(rpcBody, Encoding.UTF8, "application/json"));
+            var json = await resp.Content.ReadAsStringAsync();
+            var obj = Newtonsoft.Json.Linq.JObject.Parse(json);
+
+            if (obj["error"] != null)
+                return "预检RPC错误";
+
+            var result = obj["result"]?.ToString() ?? "0x";
+            Console.Write($"[pD={result[^6..]}] ");
+            // payoutDenominator returns uint256; if 0 → condition not resolved
+            var cleaned = result.StartsWith("0x") ? result[2..] : result;
+            cleaned = cleaned.TrimStart('0');
+            if (string.IsNullOrEmpty(cleaned) || cleaned == "0")
+                return "oracle 尚未报告结果(payoutDenominator=0)";
+
+            return null; // condition is resolved, can redeem
+        }
+        catch
+        {
+            if (attempt == 0) { await Task.Delay(1000); continue; }
+            return "预检网络错误(跳过以保护nonce)";
+        }
+    }
+    return "预检网络错误(跳过以保护nonce)";
 }
 
 // ═══════════════════════════════════════════
 //  Helper: shorten hex string for display
 // ═══════════════════════════════════════════
-Web3 CreateSignedWeb3()
+Web3 CreateSignedWeb3(string? rpcUrl = null)
 {
     var handler = new System.Net.Http.HttpClientHandler
     {
@@ -993,7 +1247,7 @@ Web3 CreateSignedWeb3()
         UseProxy = true
     };
     var httpClient = new System.Net.Http.HttpClient(handler);
-    var rpcClient = new RpcClient(new Uri(POLYGON_RPC), httpClient);
+    var rpcClient = new RpcClient(new Uri(rpcUrl ?? POLYGON_RPC), httpClient);
     return new Web3(account, rpcClient);
 }
 
