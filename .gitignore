@@ -7,3 +7,4 @@ bin/
 packages/
 test_config.json
 output*.txt
+*.lscache
